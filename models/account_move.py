@@ -33,7 +33,9 @@ class AccountMove(models.Model):
 
         if last_move and last_move.name:
             try:
-                last_seq = int(last_move.name[-4:])
+                last_move_name = last_move.name
+                lest_seq_str = last_move_name.split("/")[-1]
+                last_seq = int(lest_seq_str)
             except ValueError:
                 last_seq = 0
         else:
@@ -41,7 +43,15 @@ class AccountMove(models.Model):
 
         # Next sequence number
         next_seq = last_seq + 1
-        return f"{prefix}{next_seq:04d}"
+        new_name = f"{prefix}{next_seq:04d}"
+
+        for i in range(10):
+            if len(self.search([('name', '=', new_name)])) == 0:
+                break
+            next_seq += 1
+            new_name = f"{prefix}{next_seq:04d}"
+
+        return new_name
 
     def action_post(self):
         for move in self:
