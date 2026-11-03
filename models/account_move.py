@@ -1,64 +1,86 @@
-from odoo import models, api, _
-from odoo.exceptions import UserError, ValidationError
-from psycopg2 import IntegrityError
+import logging
+
+from odoo import models
+
+_logger = logging.getLogger(__name__)
+
+# Key in the transaction-wide cursor cache holding ids of moves being posted
+# for the first time. The name recompute does not reliably run with the
+# context of ``_post`` (it uses the env of whoever flushes), so the cursor
+# cache is used to pass this information along.
+_FIRST_POST_KEY = "account_sequence_safe.first_post_ids"
+
 
 class AccountMove(models.Model):
-    _inherit = 'account.move'
+    _inherit = "account.move"
 
-    def _get_next_sequence_name(self):
-        """Fallback: compute next name manually if journal's sequence fails."""
-        self.ensure_one()
-
-        journal = self.journal_id
-        if not journal or not self.date:
-            return '/'
-
-        year = self.date.year
-        month = self.date.month
-
-        # Base format prefix (without seq)
-        prefix = f"{journal.code}/{year:04d}/{month:02d}/"
-
-        # Find the highest sequence number already used
-        last_move = None
+    def _post(self, soft=True):
+        pending = self.env.cr.cache.setdefault(_FIRST_POST_KEY, set())
+        added = set(self.filtered(lambda m: not m.posted_before).ids) - pending
+        pending |= added
         try:
-            last_move = self.search(
-                [('journal_id', '=', journal.id),
-                ('name', 'like', prefix)],
-                order='name desc',
-                limit=1
-            )
-        except Exception as e:
-            last_move = None
+            return super()._post(soft=soft)
+        finally:
+            pending -= added
 
-        if last_move and last_move.name:
-            try:
-                last_move_name = last_move.name
-                lest_seq_str = last_move_name.split("/")[-1]
-                last_seq = int(lest_seq_str)
-            except ValueError:
-                last_seq = 0
-        else:
-            last_seq = 0
+    def _compute_name(self):
+        """Let Odoo number the moves, then skip numbers already in use.
 
-        # Next sequence number
-        next_seq = last_seq + 1
-        new_name = f"{prefix}{next_seq:04d}"
+        Odoo looks for the last number only among moves of the same journal
+        whose *date* is in the same period (month/year). A move whose date was
+        moved to another period keeps its old name, so that name is invisible
+        to the lookup and gets handed out again, which then fails with
+        "Posted journal entry must have an unique sequence number per company".
 
-        for i in range(10):
-            if len(self.search([('name', '=', new_name)])) == 0:
-                break
-            next_seq += 1
-            new_name = f"{prefix}{next_seq:04d}"
+        Odoo's row lock in ``_get_last_sequence`` still serialises concurrent
+        posts, so skipping taken names here keeps numbering race-free.
+        """
+        previous = {move: move.name for move in self}
+        super()._compute_name()
+        first_post = self.env.cr.cache.get(_FIRST_POST_KEY, set())
+        to_check = self.filtered(
+            lambda m: m.state == "posted"
+            and m.name and m.name != "/"
+            and (m.id in first_post or m.name != previous.get(m))
+        )
+        if to_check:
+            to_check._sequence_safe_skip_taken_names()
 
-        return new_name
+    def _sequence_safe_skip_taken_names(self):
+        """Give every move in ``self`` a number not used by any other move of its journal.
 
-    def action_post(self):
-        for move in self:
-            # If move has no assigned sequence yet OR the date has changed
-            if move.name == '/' or move._context.get('force_renumber', False):
-                new_name = move._get_next_sequence_name()
-                move.with_context(check_move_validity=False).write({'name': new_name})
+        "Used" means any other move of the journal with the same prefix and
+        number, whatever its state or type: drafts and cancelled moves that
+        hold a number would clash again when (re)posted.
+        """
+        self.flush([self._sequence_field, "sequence_number", "sequence_prefix"])
+        own_ids = tuple(self.ids) or (0,)
+        taken = {}  # (journal_id, prefix) -> set of numbers in use
 
-        # Now safely post (no name conflicts will happen here)
-        return super().action_post()
+        for move in self.sorted(lambda m: (m.date, m.ref or "", m.id)):
+            key = (move.journal_id.id, move.sequence_prefix)
+            if key not in taken:
+                self.env.cr.execute(
+                    """
+                    SELECT sequence_number FROM account_move
+                    WHERE journal_id = %s AND sequence_prefix = %s AND id NOT IN %s
+                    """,
+                    (key[0], key[1], own_ids),
+                )
+                taken[key] = {row[0] for row in self.env.cr.fetchall()}
+            numbers = taken[key]
+
+            if move.sequence_number in numbers:
+                seq_format, values = move._get_sequence_format_param(move.name)
+                seq = values["seq"]
+                while seq in numbers:
+                    seq += 1
+                values["seq"] = seq
+                new_name = seq_format.format(**values)
+                _logger.warning(
+                    "account_sequence_safe: %s is already used in journal %s, using %s instead",
+                    move.name, move.journal_id.code, new_name,
+                )
+                move.name = new_name
+                move._compute_split_sequence()
+            numbers.add(move.sequence_number)
